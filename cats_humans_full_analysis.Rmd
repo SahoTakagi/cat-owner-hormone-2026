@@ -1,0 +1,891 @@
+---
+title: "Cats and humans show correlated affiliative physiological states — Full Analysis Code"
+author: "Saho Takagi et al."
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(dplyr)
+library(tidyr)
+library(brms)
+library(purrr)
+library(tidybayes)
+library(ggplot2)
+library(patchwork)
+library(loo)
+```
+
+# Overview
+
+This script reproduces all statistical analyses and figures reported in
+"Cats and humans show correlated affiliative physiological states." It is
+organized in the same order as the manuscript:
+
+1. Data import and cleaning
+2. Figure 1 / Table S2 — Multivariate model of owner–cat hormonal associations
+3. Figure 2 / Table S3 — Hormone–mood associations (primary analysis: individual cat level;
+   household-aggregated sensitivity analysis: Table S4)
+4. Figure 3 / Table S5 / Table S8 — Proximity, cohabitation duration, mood, and the cat-age
+   confound check (primary analysis: individual cat level; household-aggregated sensitivity
+   analysis: Table S6)
+5. Table S7 — Secure Base Test (SBT) hurdle Gamma models
+
+Mood (POMS2) is reported once per owner and therefore shared across all cats in a household.
+Because mood does not vary within a household, including owner identity as a group-level
+(random) intercept in cat-level models is non-identifiable (models fail to converge, R-hat > 3).
+Dyad-level (cat-level) models without a group-level term are therefore reported as the primary
+analysis, with household-level aggregation (mean across cats within a household) retained as a
+sensitivity analysis.
+
+Random seeds (`seed = 123`) are fixed throughout for exact reproducibility
+of posterior draws, though minor numerical differences may occur across
+machines/Stan versions.
+
+# 1. Data Import and Cleaning
+
+```{r load-data}
+# Supplementary_rawdata.csv contains 29 cats (rows), one row per cat, with
+# 20 columns (ID plus 19 variables). Column names are already clean
+# snake_case, so no additional cleaning is required after read.csv().
+catdata <- read.csv("Supplementary_rawdata.csv", stringsAsFactors = FALSE)
+
+# Columns (20 total):
+# ID, cohabitation_duration_months, cat_age_months, proximity_median_rssi,
+# sbt_circle_time_owner_baseline_sec, sbt_circle_time_owner_return_sec,
+# sbt_circle_time_stranger_baseline_sec, sbt_circle_time_stranger_return_sec,
+# owner_oxytocin, owner_cortisol_creatinine_corrected,
+# cat_oxytocin, cat_cortisol_creatinine_corrected,
+# poms_anger_hostility, poms_confusion_bewilderment, poms_depression_dejection,
+# poms_fatigue_inertia, poms_tension_anxiety, poms_vigor_activity,
+# poms_friendliness, poms_total_mood_disturbance
+stopifnot(nrow(catdata) == 29)
+```
+
+## 1.1 Owner ID mapping
+
+Nineteen owners contributed one to four cats each. This mapping links each
+cat (`ID`) to its owner (`owner_id`) and is required for all group-level
+(random-effects) models and household-level sensitivity aggregations below.
+
+```{r owner-map}
+owner_map <- c(
+  C01 = "H01", C02 = "H02", C03 = "H02", C04 = "H03", C05 = "H04",
+  C06 = "H05", C07 = "H05", C08 = "H05", C09 = "H05",
+  C10 = "H06", C11 = "H07", C12 = "H07", C13 = "H08", C14 = "H09", C15 = "H09",
+  C16 = "H10", C17 = "H11", C18 = "H12", C19 = "H12", C20 = "H13", C21 = "H14",
+  C22 = "H15", C23 = "H15", C24 = "H16", C25 = "H17", C26 = "H17",
+  C27 = "H18", C28 = "H19", C29 = "H19"
+)
+
+catdata$owner_id <- owner_map[catdata$ID]
+stopifnot(length(unique(catdata$owner_id)) == 19)
+```
+
+# 2. Figure 1 / Table S2: Multivariate Model of Owner–Cat Hormonal Associations
+
+Cat oxytocin and cat cortisol concentrations are modeled jointly as correlated
+response variables, with owner oxytocin and owner cortisol entered
+simultaneously as predictors of both. Owner identity is included as a
+group-level (random) intercept for both responses (`(1 | p | owner_id)`,
+where `p` links the two response-specific intercepts so their correlation
+is estimated).
+
+```{r fig1-data}
+df_mv <- catdata %>%
+  transmute(
+    ID,
+    owner_id,
+    OT_owner_z   = scale(owner_oxytocin)[, 1],
+    Cort_owner_z = scale(owner_cortisol_creatinine_corrected)[, 1],
+    OT_cat_z     = scale(cat_oxytocin)[, 1],
+    Cort_cat_z   = scale(cat_cortisol_creatinine_corrected)[, 1]
+  ) %>%
+  filter(!is.na(OT_cat_z), !is.na(Cort_cat_z))
+
+nrow(df_mv)                          # expected: 24
+length(unique(df_mv$owner_id))       # expected: 17
+```
+
+```{r fig1-model, cache=TRUE}
+bf_ot   <- bf(OT_cat_z   ~ OT_owner_z + Cort_owner_z + (1 | p | owner_id))
+bf_cort <- bf(Cort_cat_z ~ OT_owner_z + Cort_owner_z + (1 | p | owner_id))
+
+model_mv <- brm(
+  bf_ot + bf_cort + set_rescor(TRUE),
+  data = df_mv,
+  family = gaussian(),
+  prior = c(
+    prior(normal(0, 1),    class = "b",     resp = "OTcatz"),
+    prior(normal(0, 1),    class = "b",     resp = "Cortcatz"),
+    prior(exponential(1),  class = "sd",    resp = "OTcatz"),
+    prior(exponential(1),  class = "sd",    resp = "Cortcatz"),
+    prior(exponential(1),  class = "sigma", resp = "OTcatz"),
+    prior(exponential(1),  class = "sigma", resp = "Cortcatz")
+  ),
+  chains = 4, iter = 6000, warmup = 3000,
+  control = list(adapt_delta = 0.99, max_treedepth = 15),
+  cores = 4, seed = 123
+)
+
+summary(model_mv)
+```
+
+## 2.1 Convergence diagnostics
+
+```{r fig1-diagnostics}
+max(rhat(model_mv), na.rm = TRUE)
+sum(subset(nuts_params(model_mv), Parameter == "divergent__")$Value)
+```
+
+## 2.2 Sensitivity analysis: outlier exclusion
+
+One owner cortisol value was a notable outlier (standardized ≈ 3.5). We
+refit the model excluding this observation to confirm the owner
+cortisol → cat oxytocin association was not driven by this single point.
+
+```{r fig1-sensitivity, cache=TRUE}
+df_mv_excl <- df_mv %>% filter(Cort_owner_z < 3)
+
+model_mv_excl <- update(model_mv, newdata = df_mv_excl)
+fixef(model_mv_excl)["OTcatz_Cort_owner_z", ]
+```
+
+## 2.3 Correlation matrix (for interpreting the multivariate coefficients)
+
+```{r fig1-cormat}
+round(cor(df_mv[, c("OT_owner_z", "Cort_owner_z", "OT_cat_z", "Cort_cat_z")]), 3)
+```
+
+## 2.4 Figure 1
+
+```{r fig1-plot, fig.width=10, fig.height=8}
+draws <- as_draws_df(model_mv) %>%
+  select(
+    `Cat OT ~ Owner OT`             = b_OTcatz_OT_owner_z,
+    `Cat OT ~ Owner cortisol`       = b_OTcatz_Cort_owner_z,
+    `Cat cortisol ~ Owner OT`       = b_Cortcatz_OT_owner_z,
+    `Cat cortisol ~ Owner cortisol` = b_Cortcatz_Cort_owner_z
+  ) %>%
+  tidyr::pivot_longer(everything(), names_to = "path", values_to = "estimate") %>%
+  mutate(path = factor(path, levels = rev(c(
+    "Cat OT ~ Owner OT",
+    "Cat OT ~ Owner cortisol",
+    "Cat cortisol ~ Owner OT",
+    "Cat cortisol ~ Owner cortisol"
+  ))))
+
+p_panelA_fig1 <- draws %>%
+  ggplot(aes(x = estimate, y = path)) +
+  geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.4) +
+  stat_pointinterval(
+    .width = c(0.5, 0.95),
+    point_size = 2.3,
+    interval_size_range = c(0.8, 2.4)
+  ) +
+  labs(x = "Standardized posterior estimate", y = NULL) +
+  theme_classic(base_size = 16) +
+  theme(axis.text.y = element_text(size = 13))
+
+ce_df <- conditional_effects(model_mv, resp = "OTcatz")
+
+p_panelB_fig1 <- ggplot(ce_df[["OTcatz.OTcatz_OT_owner_z"]],
+                         aes(x = OT_owner_z, y = estimate__)) +
+  geom_ribbon(aes(ymin = lower__, ymax = upper__), fill = "grey80") +
+  geom_line(linewidth = 1.2, colour = "black") +
+  geom_point(data = df_mv, aes(x = OT_owner_z, y = OT_cat_z),
+             inherit.aes = FALSE, size = 3, colour = "grey20") +
+  labs(x = "Owner oxytocin (standardized)",
+       y = "Cat oxytocin (standardized)") +
+  theme_classic(base_size = 16)
+
+p_panelC_fig1 <- ggplot(ce_df[["OTcatz.OTcatz_Cort_owner_z"]],
+                         aes(x = Cort_owner_z, y = estimate__)) +
+  geom_ribbon(aes(ymin = lower__, ymax = upper__), fill = "grey80") +
+  geom_line(linewidth = 1.2, colour = "black") +
+  geom_point(data = df_mv, aes(x = Cort_owner_z, y = OT_cat_z),
+             inherit.aes = FALSE, size = 3, colour = "grey20") +
+  labs(x = "Owner cortisol (standardized)",
+       y = NULL) +
+  theme_classic(base_size = 16)
+
+fig1 <- free(p_panelA_fig1, side = "l") / (p_panelB_fig1 | p_panelC_fig1) +
+  plot_annotation(tag_levels = "A") &
+  theme(plot.tag = element_text(face = "bold", size = 16))
+
+fig1
+ggsave("Figure1_hormonal_multivariate.png", fig1, width = 10, height = 8, dpi = 400)
+```
+
+---
+
+# 3. Figure 2 / Table S3: Hormone–Mood Associations
+
+## 3.1 Cat-level data (primary analysis)
+
+Each cat–owner dyad is modeled individually, without aggregation
+(n = 29 dyads for owner-hormone models; n = 24 for cat-hormone models,
+reflecting missing cat urine samples). Owner mood is shared across all
+cats belonging to the same household; because it does not vary within a
+household, a group-level (random) intercept for `owner_id` is
+non-identifiable for these models (see Overview) and is therefore omitted.
+
+```{r fig2-data-catlevel}
+df_poms_catlevel <- catdata %>%
+  select(ID, owner_id, owner_oxytocin, cat_oxytocin,
+         owner_cortisol_creatinine_corrected, cat_cortisol_creatinine_corrected,
+         proximity_median_rssi, cohabitation_duration_months, cat_age_months,
+         starts_with("poms_")) %>%
+  mutate(
+    OT_owner_z   = scale(owner_oxytocin)[, 1],
+    OT_cat_z     = scale(cat_oxytocin)[, 1],
+    Cort_owner_z = scale(owner_cortisol_creatinine_corrected)[, 1],
+    Cort_cat_z   = scale(cat_cortisol_creatinine_corrected)[, 1],
+    proximity_z  = scale(proximity_median_rssi)[, 1],
+    breeding_z   = scale(cohabitation_duration_months)[, 1],
+    age_z        = scale(cat_age_months)[, 1]
+  ) %>%
+  pivot_longer(starts_with("poms_"), names_to = "poms", values_to = "score") %>%
+  group_by(poms) %>%
+  mutate(score_z = scale(score)[, 1]) %>%
+  ungroup() %>%
+  mutate(
+    poms_label = dplyr::recode(poms,
+      poms_anger_hostility        = "Anger-Hostility",
+      poms_confusion_bewilderment = "Confusion-Bewilderment",
+      poms_depression_dejection   = "Depression-Dejection",
+      poms_friendliness           = "Friendliness",
+      poms_fatigue_inertia        = "Fatigue-Inertia",
+      poms_tension_anxiety        = "Tension-Anxiety",
+      poms_total_mood_disturbance = "Total mood disturbance",
+      poms_vigor_activity         = "Vigor-Activity"
+    )
+  )
+
+# Expected group sizes:
+df_poms_catlevel %>% filter(!is.na(OT_owner_z)) %>% distinct(ID) %>% nrow()  # 29
+df_poms_catlevel %>% filter(!is.na(OT_cat_z))   %>% distinct(ID) %>% nrow()  # 24
+```
+
+## 3.2 Model-fitting function (cat-level, no group-level term)
+
+```{r fig2-fit-function-catlevel}
+fit_poms_catlevel <- function(hormone_var, df) {
+  df %>%
+    filter(!is.na(.data[[hormone_var]])) %>%
+    group_by(poms_label) %>%
+    nest() %>%
+    mutate(
+      model = map(
+        data,
+        ~ brm(
+          formula = as.formula(paste0("score_z ~ ", hormone_var)),
+          data = .x,
+          family = gaussian(),
+          chains = 4, iter = 6000, warmup = 3000,
+          control = list(adapt_delta = 0.99, max_treedepth = 15),
+          cores = 4, seed = 123
+        )
+      )
+    )
+}
+
+check_rhat <- function(model_tbl) {
+  model_tbl %>%
+    mutate(max_rhat = map_dbl(model, ~ max(rhat(.x), na.rm = TRUE))) %>%
+    select(poms_label, max_rhat)
+}
+```
+
+```{r fig2-fit-models-catlevel, cache=TRUE}
+models_OT_owner_catlevel   <- fit_poms_catlevel("OT_owner_z",   df_poms_catlevel)
+models_Cort_owner_catlevel <- fit_poms_catlevel("Cort_owner_z", df_poms_catlevel)
+models_OT_cat_catlevel     <- fit_poms_catlevel("OT_cat_z",     df_poms_catlevel)
+models_Cort_cat_catlevel   <- fit_poms_catlevel("Cort_cat_z",   df_poms_catlevel)
+
+check_rhat(models_OT_owner_catlevel)
+check_rhat(models_Cort_owner_catlevel)
+check_rhat(models_OT_cat_catlevel)
+check_rhat(models_Cort_cat_catlevel)
+```
+
+## 3.3 Coefficient extraction, full summary, and Table S3
+
+```{r fig2-extract-catlevel}
+extract_poms_coef <- function(model_tbl, hormone_label, coef_name) {
+  model_tbl %>%
+    mutate(draws = map(model, ~ spread_draws(.x, !!sym(coef_name)))) %>%
+    select(poms_label, draws) %>%
+    unnest(draws) %>%
+    rename(estimate = !!sym(coef_name)) %>%
+    group_by(poms_label) %>%
+    median_qi(estimate, .width = c(.50, .95)) %>%
+    ungroup() %>%
+    mutate(hormone = hormone_label)
+}
+
+extract_full_summary <- function(model_tbl, hormone_label) {
+  model_tbl %>%
+    mutate(
+      summ = map(model, ~ as.data.frame(summary(.x)$fixed) %>%
+                   tibble::rownames_to_column("term"))
+    ) %>%
+    select(poms_label, summ) %>%
+    unnest(summ) %>%
+    mutate(hormone = hormone_label)
+}
+
+poms_hormone_coef_catlevel <- bind_rows(
+  extract_poms_coef(models_OT_owner_catlevel,   "Owner oxytocin", "b_OT_owner_z"),
+  extract_poms_coef(models_OT_cat_catlevel,     "Cat oxytocin",   "b_OT_cat_z"),
+  extract_poms_coef(models_Cort_owner_catlevel, "Owner cortisol", "b_Cort_owner_z"),
+  extract_poms_coef(models_Cort_cat_catlevel,   "Cat cortisol",   "b_Cort_cat_z")
+)
+print(poms_hormone_coef_catlevel %>% filter(.width == 0.95), n = Inf)
+
+# Full model summaries (Estimate, Est.Error, CI, Rhat, Bulk_ESS, Tail_ESS) for Table S3
+s3_catlevel_all <- bind_rows(
+  extract_full_summary(models_OT_owner_catlevel,   "Owner oxytocin"),
+  extract_full_summary(models_Cort_owner_catlevel, "Owner cortisol"),
+  extract_full_summary(models_OT_cat_catlevel,     "Cat oxytocin"),
+  extract_full_summary(models_Cort_cat_catlevel,   "Cat cortisol")
+)
+print(s3_catlevel_all, n = Inf)
+write.csv(s3_catlevel_all, "S3_catlevel_raw.csv", row.names = FALSE)
+```
+
+## 3.4 Figure 2
+
+```{r fig2-plot-catlevel, fig.width=10, fig.height=8}
+p_poms_hormone <- poms_hormone_coef_catlevel %>%
+  mutate(
+    poms_label = factor(poms_label, levels = rev(c(
+      "Total mood disturbance", "Tension-Anxiety", "Depression-Dejection",
+      "Confusion-Bewilderment", "Fatigue-Inertia", "Anger-Hostility",
+      "Friendliness", "Vigor-Activity"
+    ))),
+    hormone = factor(hormone, levels = c(
+      "Owner oxytocin", "Cat oxytocin", "Owner cortisol", "Cat cortisol"
+    ))
+  ) %>%
+  ggplot(aes(x = estimate, y = poms_label)) +
+  geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.4) +
+  geom_linerange(data = ~ filter(.x, .width == 0.95),
+                 aes(xmin = .lower, xmax = .upper), linewidth = 0.8) +
+  geom_linerange(data = ~ filter(.x, .width == 0.50),
+                 aes(xmin = .lower, xmax = .upper), linewidth = 2.4) +
+  geom_point(size = 2.3) +
+  facet_wrap(~ hormone) +
+  labs(x = "Standardized posterior estimate", y = NULL) +
+  theme_classic(base_size = 14) +
+  theme(
+    strip.text = element_text(size = 12),
+    axis.text.y = element_text(size = 10),
+    axis.text.x = element_text(size = 10),
+    axis.title.x = element_text(size = 13),
+    panel.spacing = unit(1.5, "lines")
+  )
+
+p_poms_hormone
+ggsave("Figure2_hormonal_POMS.png", p_poms_hormone, width = 10, height = 8, dpi = 600)
+```
+
+## 3.5 Sensitivity analysis: household-level aggregation (Table S4)
+
+As a sensitivity analysis, all variables are aggregated to the household
+level (mean across cats within a household) prior to model fitting.
+
+```{r fig2-data-household-agg}
+df_poms_owner_agg <- catdata %>%
+  group_by(owner_id) %>%
+  summarise(
+    owner_oxytocin = mean(owner_oxytocin, na.rm = TRUE),
+    owner_cortisol_creatinine_corrected = mean(owner_cortisol_creatinine_corrected, na.rm = TRUE),
+    across(starts_with("poms_"), ~ mean(.x, na.rm = TRUE)),
+    .groups = "drop"
+  ) %>%
+  mutate(across(where(is.numeric), ~ na_if(., NaN))) %>%
+  mutate(
+    OT_owner_z   = scale(owner_oxytocin)[, 1],
+    Cort_owner_z = scale(owner_cortisol_creatinine_corrected)[, 1]
+  ) %>%
+  pivot_longer(starts_with("poms_"), names_to = "poms", values_to = "score") %>%
+  group_by(poms) %>%
+  mutate(score_z = scale(score)[, 1]) %>%
+  ungroup() %>%
+  mutate(
+    poms_label = recode(poms,
+      poms_anger_hostility        = "Anger-Hostility",
+      poms_confusion_bewilderment = "Confusion-Bewilderment",
+      poms_depression_dejection   = "Depression-Dejection",
+      poms_friendliness           = "Friendliness",
+      poms_fatigue_inertia        = "Fatigue-Inertia",
+      poms_tension_anxiety        = "Tension-Anxiety",
+      poms_total_mood_disturbance = "Total mood disturbance",
+      poms_vigor_activity         = "Vigor-Activity"
+    )
+  )
+
+df_poms_cat_agg <- catdata %>%
+  group_by(owner_id) %>%
+  summarise(
+    cat_oxytocin = mean(cat_oxytocin, na.rm = TRUE),
+    cat_cortisol_creatinine_corrected = mean(cat_cortisol_creatinine_corrected, na.rm = TRUE),
+    across(starts_with("poms_"), ~ mean(.x, na.rm = TRUE)),
+    .groups = "drop"
+  ) %>%
+  mutate(across(where(is.numeric), ~ na_if(., NaN))) %>%
+  mutate(
+    OT_cat_z   = scale(cat_oxytocin)[, 1],
+    Cort_cat_z = scale(cat_cortisol_creatinine_corrected)[, 1]
+  ) %>%
+  pivot_longer(starts_with("poms_"), names_to = "poms", values_to = "score") %>%
+  group_by(poms) %>%
+  mutate(score_z = scale(score)[, 1]) %>%
+  ungroup() %>%
+  mutate(
+    poms_label = recode(poms,
+      poms_anger_hostility        = "Anger-Hostility",
+      poms_confusion_bewilderment = "Confusion-Bewilderment",
+      poms_depression_dejection   = "Depression-Dejection",
+      poms_friendliness           = "Friendliness",
+      poms_fatigue_inertia        = "Fatigue-Inertia",
+      poms_tension_anxiety        = "Tension-Anxiety",
+      poms_total_mood_disturbance = "Total mood disturbance",
+      poms_vigor_activity         = "Vigor-Activity"
+    )
+  )
+
+# Expected group sizes:
+n_distinct(df_poms_owner_agg$owner_id)                                         # 19
+df_poms_cat_agg %>% filter(!is.na(OT_cat_z)) %>% distinct(owner_id) %>% nrow() # 17
+```
+
+```{r fig2-fit-function-household}
+fit_poms_by_hormone <- function(hormone_var, df) {
+  df %>%
+    filter(!is.na(.data[[hormone_var]])) %>%
+    group_by(poms_label) %>%
+    nest() %>%
+    mutate(
+      model = map(
+        data,
+        ~ brm(
+          formula = as.formula(paste0("score_z ~ ", hormone_var)),
+          data = .x,
+          family = gaussian(),
+          chains = 4, iter = 6000, warmup = 3000,
+          control = list(adapt_delta = 0.99, max_treedepth = 15),
+          cores = 4, seed = 123
+        )
+      )
+    )
+}
+```
+
+```{r fig2-fit-models-household, cache=TRUE}
+models_OT_owner_agg   <- fit_poms_by_hormone("OT_owner_z",   df_poms_owner_agg)
+models_Cort_owner_agg <- fit_poms_by_hormone("Cort_owner_z", df_poms_owner_agg)
+models_OT_cat_agg     <- fit_poms_by_hormone("OT_cat_z",     df_poms_cat_agg)
+models_Cort_cat_agg   <- fit_poms_by_hormone("Cort_cat_z",   df_poms_cat_agg)
+```
+
+```{r fig2-extract-household}
+poms_hormone_coef_agg <- bind_rows(
+  extract_poms_coef(models_OT_owner_agg,   "Owner oxytocin", "b_OT_owner_z"),
+  extract_poms_coef(models_OT_cat_agg,     "Cat oxytocin",   "b_OT_cat_z"),
+  extract_poms_coef(models_Cort_owner_agg, "Owner cortisol", "b_Cort_owner_z"),
+  extract_poms_coef(models_Cort_cat_agg,   "Cat cortisol",   "b_Cort_cat_z")
+)
+print(poms_hormone_coef_agg, n = Inf)
+
+s4_household_all <- bind_rows(
+  extract_full_summary(models_OT_owner_agg,   "Owner oxytocin"),
+  extract_full_summary(models_Cort_owner_agg, "Owner cortisol"),
+  extract_full_summary(models_OT_cat_agg,     "Cat oxytocin"),
+  extract_full_summary(models_Cort_cat_agg,   "Cat cortisol")
+)
+print(s4_household_all, n = Inf)
+write.csv(s4_household_all, "S4_household_raw.csv", row.names = FALSE)
+```
+
+---
+
+# 4. Figure 3 / Table S5 / Table S8: Proximity, Cohabitation Duration, and Mood
+
+## 4.1 Proximity and cohabitation models (cat-level, primary analysis)
+
+Reuses `df_poms_catlevel` (Section 3.1) and `fit_poms_catlevel()` (Section 3.2).
+
+```{r fig3-catlevel-models, cache=TRUE}
+models_proximity_catlevel <- fit_poms_catlevel("proximity_z", df_poms_catlevel)
+models_breeding_catlevel  <- fit_poms_catlevel("breeding_z",  df_poms_catlevel)
+
+check_rhat(models_proximity_catlevel)
+check_rhat(models_breeding_catlevel)
+
+proximity_coef_catlevel    <- extract_poms_coef(models_proximity_catlevel, "Proximity",     "b_proximity_z")
+cohabitation_coef_catlevel <- extract_poms_coef(models_breeding_catlevel,  "Cohabitation", "b_breeding_z")
+
+# Combined coefficient object used in Figure 3 Panel A
+catlevel_coef <- bind_rows(
+  proximity_coef_catlevel,
+  cohabitation_coef_catlevel
+)
+
+print(proximity_coef_catlevel, n = Inf)
+print(cohabitation_coef_catlevel, n = Inf)
+
+s5_catlevel_all <- bind_rows(
+  extract_full_summary(models_proximity_catlevel, "Proximity"),
+  extract_full_summary(models_breeding_catlevel,  "Cohabitation")
+)
+print(s5_catlevel_all, n = Inf)
+write.csv(s5_catlevel_all, "S5_catlevel_raw.csv", row.names = FALSE)
+```
+
+## 4.2 Cat-age confound check: LOO model comparison (Table S8, primary analysis)
+
+Cohabitation duration and cat age are strongly correlated at the individual
+cat level (r = 0.89). To evaluate whether cat age, rather than cohabitation
+duration itself, accounts for the associations observed in Section 4.1, we
+compare three models (cohabitation alone, cat age alone, both together) for
+each POMS2 subscale showing a credible association with cohabitation
+duration (Confusion-Bewilderment, Depression-Dejection, Tension-Anxiety,
+and Total Mood Disturbance).
+
+```{r fig3-confound-check-catlevel, cache=TRUE}
+# Cat-level correlation between cohabitation duration and cat age
+cor(catdata$cohabitation_duration_months, catdata$cat_age_months, use = "complete.obs")
+
+fit_confound_check <- function(poms_target, df) {
+  d <- df %>% filter(poms == poms_target)
+
+  m_breed <- brm(score_z ~ breeding_z,         data = d, chains = 4, iter = 4000, cores = 4, seed = 123,
+                  save_pars = save_pars(all = TRUE))
+  m_age   <- brm(score_z ~ age_z,              data = d, chains = 4, iter = 4000, cores = 4, seed = 123,
+                  save_pars = save_pars(all = TRUE))
+  m_both  <- brm(score_z ~ breeding_z + age_z, data = d, chains = 4, iter = 4000, cores = 4, seed = 123,
+                  save_pars = save_pars(all = TRUE))
+
+  list(
+    breed = m_breed, age = m_age, both = m_both,
+    loo_comparison = loo_compare(
+      loo(m_breed, moment_match = TRUE),
+      loo(m_age,   moment_match = TRUE),
+      loo(m_both,  moment_match = TRUE)
+    )
+  )
+}
+
+result_CB_cat  <- fit_confound_check("poms_confusion_bewilderment", df_poms_catlevel)
+result_DD_cat  <- fit_confound_check("poms_depression_dejection",   df_poms_catlevel)
+result_TA_cat  <- fit_confound_check("poms_tension_anxiety",        df_poms_catlevel)
+result_TMD_cat <- fit_confound_check("poms_total_mood_disturbance", df_poms_catlevel)
+
+result_CB_cat$loo_comparison
+result_DD_cat$loo_comparison
+result_TA_cat$loo_comparison
+result_TMD_cat$loo_comparison
+
+# Convergence check
+c(result_CB_cat$breed, result_CB_cat$age, result_CB_cat$both,
+  result_DD_cat$breed, result_DD_cat$age, result_DD_cat$both,
+  result_TA_cat$breed, result_TA_cat$age, result_TA_cat$both,
+  result_TMD_cat$breed, result_TMD_cat$age, result_TMD_cat$both) %>%
+  map_dbl(~ max(rhat(.x), na.rm = TRUE))
+```
+
+Across all four subscales, the model including cohabitation duration alone
+showed the best predictive performance (elpd_diff = 0); adding cat age,
+either alone or together with cohabitation duration, did not improve —
+and in most cases slightly reduced — predictive performance (see
+Supplementary Table S8). This indicates that the observed associations
+with cohabitation duration are not attributable to cat age, though the two
+variables cannot be fully disentangled given their high collinearity in
+this sample (see Limitations).
+
+## 4.3 Figure 3
+
+```{r fig3-plot-catlevel, fig.width=16, fig.height=9}
+# ============================================================
+# Figure 3
+# Panel A: posterior estimates for Proximity / Cohabitation
+# Panels B-D: Proximity × VA, DD, TA
+# Panels E-G: Cohabitation × VA, DD, TA
+# ============================================================
+
+fig3_panelA_data <- catlevel_coef %>%
+  filter(hormone %in% c("Proximity", "Cohabitation")) %>%
+  mutate(
+    poms_label = factor(
+      poms_label,
+      levels = c(
+        "Vigor-Activity",
+        "Friendliness",
+        "Anger-Hostility",
+        "Fatigue-Inertia",
+        "Confusion-Bewilderment",
+        "Depression-Dejection",
+        "Tension-Anxiety",
+        "Total mood disturbance"
+      )
+    )
+  )
+
+pd <- position_dodge(width = 0.5)
+
+p_panelA <- ggplot(
+  fig3_panelA_data,
+  aes(x = estimate, y = poms_label, color = hormone)
+) +
+  geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.4, color = "black") +
+  geom_linerange(
+    data = ~ filter(.x, .width == 0.95),
+    aes(xmin = .lower, xmax = .upper),
+    linewidth = 0.8,
+    position = pd
+  ) +
+  geom_point(
+    data = ~ filter(.x, .width == 0.95),
+    size = 2.8,
+    position = pd
+  ) +
+  scale_color_manual(
+    values = c("Cohabitation" = "#2CA25F", "Proximity" = "#E6550D"),
+    breaks = c("Cohabitation", "Proximity"),
+    labels = c("Cohabitation", "Proximity")
+  ) +
+  labs(x = "Standardized posterior estimate", y = NULL, color = NULL) +
+  theme_classic(base_size = 14) +
+  theme(legend.position = c(0.93, 0.25), legend.background = element_blank())
+
+make_ce_panel <- function(model, df, poms_key, xvar, xlab, ylab, line_color) {
+  d <- df %>% filter(poms == poms_key, !is.na(.data[[xvar]]))
+  ce <- conditional_effects(model, effects = xvar)
+
+  ggplot(ce[[xvar]], aes(x = .data[[xvar]], y = estimate__)) +
+    geom_ribbon(aes(ymin = lower__, ymax = upper__), fill = "grey80") +
+    geom_line(linewidth = 1.2, colour = line_color) +
+    geom_point(data = d, aes(x = .data[[xvar]], y = score_z),
+               inherit.aes = FALSE, size = 2.5, colour = "grey20") +
+    labs(x = xlab, y = ylab) +
+    theme_classic(base_size = 13)
+}
+
+get_proximity_model <- function(label) {
+  models_proximity_catlevel %>% filter(poms_label == label) %>% pull(model) %>% .[[1]]
+}
+
+get_breeding_model <- function(label) {
+  models_breeding_catlevel %>% filter(poms_label == label) %>% pull(model) %>% .[[1]]
+}
+
+p_B1 <- make_ce_panel(get_proximity_model("Vigor-Activity"), df_poms_catlevel,
+                       "poms_vigor_activity", "proximity_z",
+                       "Proximity (standardized)", "Vigor-Activity (std.)", "#E6550D")
+p_B2 <- make_ce_panel(get_proximity_model("Depression-Dejection"), df_poms_catlevel,
+                       "poms_depression_dejection", "proximity_z",
+                       "Proximity (standardized)", "Depression-Dejection (std.)", "#E6550D")
+p_B3 <- make_ce_panel(get_proximity_model("Tension-Anxiety"), df_poms_catlevel,
+                       "poms_tension_anxiety", "proximity_z",
+                       "Proximity (standardized)", "Tension-Anxiety (std.)", "#E6550D")
+
+p_C1 <- make_ce_panel(get_breeding_model("Vigor-Activity"), df_poms_catlevel,
+                       "poms_vigor_activity", "breeding_z",
+                       "Cohabitation (standardized)", "Vigor-Activity (std.)", "#2CA25F")
+p_C2 <- make_ce_panel(get_breeding_model("Depression-Dejection"), df_poms_catlevel,
+                       "poms_depression_dejection", "breeding_z",
+                       "Cohabitation (standardized)", "Depression-Dejection (std.)", "#2CA25F")
+p_C3 <- make_ce_panel(get_breeding_model("Tension-Anxiety"), df_poms_catlevel,
+                       "poms_tension_anxiety", "breeding_z",
+                       "Cohabitation (standardized)", "Tension-Anxiety (std.)", "#2CA25F")
+
+panel_B <- p_B1 | p_B2 | p_B3
+panel_C <- p_C1 | p_C2 | p_C3
+
+fig3 <-
+  free(p_panelA, side = "l") +
+  panel_B +
+  panel_C +
+  plot_layout(
+    design = "
+    AB
+    AC
+    ",
+    widths = c(2.5, 3),
+    heights = c(1, 1)
+  ) +
+  plot_annotation(tag_levels = "A") &
+  theme(plot.tag = element_text(face = "bold", size = 16))
+
+fig3
+
+ggsave("Figure3_proximity_cohabitation_mood.png", fig3,
+       width = 16, height = 9, units = "in", dpi = 300)
+```
+
+## 4.4 Sensitivity analysis: household-level aggregation (Table S6)
+
+```{r fig3-data-household-agg}
+df_cohab_prox <- catdata %>%
+  group_by(owner_id) %>%
+  summarise(
+    breeding_period = mean(cohabitation_duration_months, na.rm = TRUE),
+    proximity        = mean(proximity_median_rssi,        na.rm = TRUE),
+    across(starts_with("poms_"), ~ mean(.x, na.rm = TRUE)),
+    .groups = "drop"
+  ) %>%
+  mutate(across(where(is.numeric), ~ na_if(., NaN))) %>%
+  mutate(
+    breeding_z  = scale(breeding_period)[, 1],
+    proximity_z = scale(proximity)[, 1]
+  ) %>%
+  pivot_longer(starts_with("poms_"), names_to = "poms", values_to = "score") %>%
+  group_by(poms) %>%
+  mutate(score_z = scale(score)[, 1]) %>%
+  ungroup() %>%
+  mutate(
+    poms_label = recode(poms,
+      poms_anger_hostility        = "Anger-Hostility",
+      poms_confusion_bewilderment = "Confusion-Bewilderment",
+      poms_depression_dejection   = "Depression-Dejection",
+      poms_friendliness           = "Friendliness",
+      poms_fatigue_inertia        = "Fatigue-Inertia",
+      poms_tension_anxiety        = "Tension-Anxiety",
+      poms_total_mood_disturbance = "Total mood disturbance",
+      poms_vigor_activity         = "Vigor-Activity"
+    )
+  )
+```
+
+```{r fig3-household-models, cache=TRUE}
+fit_by_poms_household <- function(poms_target, predictor, df) {
+  d <- df %>% filter(poms == poms_target)
+  brm(as.formula(paste0("score_z ~ ", predictor)), data = d,
+      chains = 4, iter = 6000, warmup = 3000,
+      control = list(adapt_delta = 0.99, max_treedepth = 15),
+      cores = 4, seed = 123)
+}
+
+poms_targets <- c(
+  "poms_anger_hostility", "poms_confusion_bewilderment", "poms_depression_dejection",
+  "poms_fatigue_inertia", "poms_tension_anxiety", "poms_vigor_activity",
+  "poms_friendliness", "poms_total_mood_disturbance"
+)
+poms_labels_all <- c(
+  "Anger-Hostility", "Confusion-Bewilderment", "Depression-Dejection",
+  "Fatigue-Inertia", "Tension-Anxiety", "Vigor-Activity",
+  "Friendliness", "Total mood disturbance"
+)
+
+models_proximity_household <- tibble(poms = poms_targets, poms_label = poms_labels_all) %>%
+  mutate(model = map(poms, ~ fit_by_poms_household(.x, "proximity_z", df_cohab_prox)))
+
+models_breeding_household <- tibble(poms = poms_targets, poms_label = poms_labels_all) %>%
+  mutate(model = map(poms, ~ fit_by_poms_household(.x, "breeding_z", df_cohab_prox)))
+
+check_rhat(models_proximity_household)
+check_rhat(models_breeding_household)
+
+proximity_coef_household    <- extract_poms_coef(models_proximity_household, "Proximity",    "b_proximity_z")
+cohabitation_coef_household <- extract_poms_coef(models_breeding_household,  "Cohabitation", "b_breeding_z")
+
+print(proximity_coef_household, n = Inf)
+print(cohabitation_coef_household, n = Inf)
+
+s6_household_all <- bind_rows(
+  extract_full_summary(models_proximity_household, "Proximity"),
+  extract_full_summary(models_breeding_household,  "Cohabitation")
+)
+print(s6_household_all, n = Inf)
+write.csv(s6_household_all, "S6_household_raw.csv", row.names = FALSE)
+```
+
+---
+
+# 5. Table S7: Secure Base Test (SBT) Hurdle Gamma Models
+
+## 5.1 Data preparation
+
+```{r sbt-data}
+df_in <- catdata %>%
+  select(
+    ID, owner_id,
+    owner_oxytocin, cat_oxytocin,
+    owner_cortisol_creatinine_corrected, cat_cortisol_creatinine_corrected,
+    starts_with("sbt_circle_time")
+  ) %>%
+  pivot_longer(
+    cols = starts_with("sbt_circle_time"),
+    names_to = "condition",
+    values_to = "value"
+  ) %>%
+  mutate(
+    condition = sub("^sbt_circle_time_", "", condition),
+    condition = sub("_sec$", "", condition)
+  ) %>%
+  separate(condition, into = c("target", "phase"), sep = "_") %>%
+  mutate(
+    target = factor(target),
+    phase  = factor(phase),
+    OT_owner_z   = scale(owner_oxytocin)[, 1],
+    OT_cat_z     = scale(cat_oxytocin)[, 1],
+    Cort_owner_z = scale(owner_cortisol_creatinine_corrected)[, 1],
+    Cort_cat_z   = scale(cat_cortisol_creatinine_corrected)[, 1]
+  )
+
+nrow(df_in)                       # 116 (29 cats x 4 owner/stranger x baseline/return; no missing SBT or owner-hormone values)
+n_distinct(df_in$owner_id)        # 19 (all owners; brm() below drops the 5 cats with missing cat-hormone values
+                                   #     at fit time, leaving an effective n of 24 cats / 17 owners for OT_cat_z / Cort_cat_z)
+```
+
+## 5.2 Hormone models
+
+```{r sbt-models, cache=TRUE}
+model_in_OTcat <- brm(
+  bf(
+    value ~ target * phase * OT_cat_z + (1 | owner_id/ID),
+    hu    ~ target + phase + OT_cat_z + (1 | owner_id/ID)
+  ),
+  data = df_in,
+  family = hurdle_gamma(),
+  chains = 4, iter = 6000, warmup = 3000,
+  control = list(adapt_delta = 0.99, max_treedepth = 15),
+  cores = 4, seed = 123
+)
+
+max(rhat(model_in_OTcat), na.rm = TRUE)
+sum(subset(nuts_params(model_in_OTcat), Parameter == "divergent__")$Value)
+summary(model_in_OTcat)
+
+model_in_Cort_cat_z <- brm(
+  bf(
+    value ~ target * phase * Cort_cat_z + (1 | owner_id/ID),
+    hu    ~ target + phase + Cort_cat_z + (1 | owner_id/ID)
+  ),
+  data = df_in,
+  family = hurdle_gamma(),
+  chains = 4, iter = 6000, warmup = 3000,
+  control = list(adapt_delta = 0.99, max_treedepth = 15),
+  cores = 4, seed = 123
+)
+
+max(rhat(model_in_Cort_cat_z), na.rm = TRUE)
+sum(subset(nuts_params(model_in_Cort_cat_z), Parameter == "divergent__")$Value)
+summary(model_in_Cort_cat_z)
+```
+
+---
+
+# 6. Session Information
+
+```{r session-info}
+sessionInfo()
+```
